@@ -18,9 +18,9 @@ except ImportError:
     BLEAK_AVAILABLE = False
 
 # AT命令服务和特征UUID
-AT_SERVICE_UUID = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-AT_TX_CHAR_UUID = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-AT_RX_CHAR_UUID = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+AT_SERVICE_UUID = "00006E50-0000-1000-8000-00805F9B34FB"
+AT_TX_CHAR_UUID = "00006E51-0000-1000-8000-00805F9B34FB"
+AT_RX_CHAR_UUID = "00006E52-0000-1000-8000-00805F9B34FB"
 
 
 class BLEController(QObject):
@@ -41,6 +41,9 @@ class BLEController(QObject):
         self.client = None
         self.loop = None
         self.devices = {}
+        self._shutdown = False  # 添加关闭标志
+        self.rx_char = None  # 存储RX特征对象
+        self.tx_char = None  # 存储TX特征对象
 
         if BLEAK_AVAILABLE:
             # 启动事件循环线程
@@ -51,9 +54,39 @@ class BLEController(QObject):
 
     def _run_event_loop(self):
         """运行异步事件循环"""
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
+        try:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_forever()
+        except Exception as e:
+            if not self._shutdown:
+                print(f"事件循环异常: {e}")
+
+    def shutdown(self):
+        """关闭控制器"""
+        self._shutdown = True
+        if self.loop and not self.loop.is_closed():
+            # 在事件循环中执行清理
+            asyncio.run_coroutine_threadsafe(self._cleanup(), self.loop)
+            # 停止事件循环
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+    async def _cleanup(self):
+        """异步清理资源"""
+        try:
+            if self.client and self._connected:
+                if self.rx_char:
+                    try:
+                        await self.client.stop_notify(self.rx_char)
+                    except Exception:
+                        pass
+                await self.client.disconnect()
+        except Exception as e:
+            print(f"清理资源时出错: {e}")
+        finally:
+            self.client = None
+            self.rx_char = None
+            self.tx_char = None
 
     @pyqtSlot()
     def startScan(self):
@@ -62,7 +95,7 @@ class BLEController(QObject):
             self.logMessage.emit("bleak库未安装，无法扫描", "error")
             return
 
-        if self.loop:
+        if self.loop and not self.loop.is_closed():
             asyncio.run_coroutine_threadsafe(self._scan_devices(), self.loop)
 
     @pyqtSlot()
@@ -78,19 +111,19 @@ class BLEController(QObject):
             self.logMessage.emit("bleak库未安装，无法连接", "error")
             return
 
-        if self.loop:
+        if self.loop and not self.loop.is_closed():
             asyncio.run_coroutine_threadsafe(self._connect_device(address), self.loop)
 
     @pyqtSlot()
     def disconnectDevice(self):
         """断开连接"""
-        if self.loop:
+        if self.loop and not self.loop.is_closed():
             asyncio.run_coroutine_threadsafe(self._disconnect_device(), self.loop)
 
     @pyqtSlot(str)
     def sendCommand(self, command):
         """发送AT命令"""
-        if self.loop:
+        if self.loop and not self.loop.is_closed():
             asyncio.run_coroutine_threadsafe(self._send_command(command), self.loop)
 
     async def _scan_devices(self):
@@ -104,7 +137,7 @@ class BLEController(QObject):
             self.devices.clear()
 
             def detection_callback(device, advertisement_data):
-                if self._scanning:
+                if self._scanning and not self._shutdown:
                     name = device.name if device.name else "Unknown"
                     address = device.address
                     rssi = advertisement_data.rssi
@@ -120,23 +153,28 @@ class BLEController(QObject):
             await asyncio.sleep(10)  # 扫描10秒
             await scanner.stop()
 
-            self._scanning = False
-            self.scanningChanged.emit(False)
-            device_count = len([d for d in self.devices.values() if d[0].lower().startswith('surron-')])
-            self._status = f"扫描完成，发现 {device_count} 个Surron设备"
-            self.statusChanged.emit(self._status)
-            self.logMessage.emit(f"扫描完成，发现 {device_count} 个Surron设备", "success")
+            if not self._shutdown:
+                self._scanning = False
+                self.scanningChanged.emit(False)
+                device_count = len([d for d in self.devices.values() if d[0].lower().startswith('surron-')])
+                self._status = f"扫描完成，发现 {device_count} 个Surron设备"
+                self.statusChanged.emit(self._status)
+                self.logMessage.emit(f"扫描完成，发现 {device_count} 个Surron设备", "success")
 
         except Exception as e:
-            self._scanning = False
-            self.scanningChanged.emit(False)
-            self._status = "扫描失败"
-            self.statusChanged.emit(self._status)
-            self.logMessage.emit(f"扫描失败: {str(e)}", "error")
+            if not self._shutdown:
+                self._scanning = False
+                self.scanningChanged.emit(False)
+                self._status = "扫描失败"
+                self.statusChanged.emit(self._status)
+                self.logMessage.emit(f"扫描失败: {str(e)}", "error")
 
     async def _connect_device(self, address):
         """异步连接设备"""
         try:
+            if self._shutdown:
+                return
+
             self._status = "连接中..."
             self.statusChanged.emit(self._status)
             self.logMessage.emit(f"正在连接 {address}...", "info")
@@ -173,8 +211,10 @@ class BLEController(QObject):
             for char in at_service.characteristics:
                 if char.uuid.upper() == AT_TX_CHAR_UUID.upper():
                     tx_char = char
+                    self.tx_char = char  # 保存引用
                 elif char.uuid.upper() == AT_RX_CHAR_UUID.upper():
                     rx_char = char
+                    self.rx_char = char  # 保存引用
 
             if not tx_char or not rx_char:
                 await self.client.disconnect()
@@ -185,44 +225,101 @@ class BLEController(QObject):
 
             # 启用通知
             try:
-                await self.client.start_notify(rx_char.uuid, self._notification_handler)
+                await self.client.start_notify(self.rx_char, self._notification_handler)
+                self.logMessage.emit("通知已启用", "success")
+
+                # 测试通知是否工作
+                print(f"RX特征: {self.rx_char.uuid}, 属性: {self.rx_char.properties}")
+                print(f"TX特征: {self.tx_char.uuid}, 属性: {self.tx_char.properties}")
+
             except Exception as e:
-                self.logMessage.emit(f"启用通知失败: {e}", "warning")
+                self.logMessage.emit(f"启用通知失败: {e}", "error")
+                # 即使通知失败也继续连接，某些设备可能不支持通知
+                print(f"通知启用失败: {e}")
 
-            self._connected = True
-            self.connectedChanged.emit(True)
-            self._status = f"已连接到 {address}"
-            self.statusChanged.emit(self._status)
-            self.logMessage.emit(f"成功连接到 {address}", "success")
+            if not self._shutdown:
+                self._connected = True
+                self.connectedChanged.emit(True)
+                self._status = f"已连接到 {address}"
+                self.statusChanged.emit(self._status)
+                self.logMessage.emit(f"成功连接到 {address}", "success")
 
-            # 显示设备信息
-            self._log_device_info(services)
+                # 显示设备信息
+                self._log_device_info(services)
 
         except Exception as e:
-            self._status = "连接失败"
-            self.statusChanged.emit(self._status)
-            self.logMessage.emit(f"连接失败: {str(e)}", "error")
+            if not self._shutdown:
+                self._status = "连接失败"
+                self.statusChanged.emit(self._status)
+                self.logMessage.emit(f"连接失败: {str(e)}", "error")
+
+            # 清理客户端
             if self.client:
                 try:
-                    await self.client.disconnect()
-                except:
+                    if self.client.is_connected:
+                        await self.client.disconnect()
+                except Exception:
                     pass
-                self.client = None
+                finally:
+                    self.client = None
 
     async def _disconnect_device(self):
         """异步断开连接"""
-        if self.client and self._connected:
-            try:
-                await self.client.disconnect()
+        try:
+            if self.client:
+                # 先更新连接状态，避免重复调用
+                if self._connected:
+                    self._connected = False
+                    if not self._shutdown:
+                        self.connectedChanged.emit(False)
+
+                # 检查客户端是否还连接着
+                if hasattr(self.client, 'is_connected'):
+                    try:
+                        is_connected = self.client.is_connected
+                    except Exception:
+                        is_connected = False
+                else:
+                    is_connected = False
+
+                # 停止通知
+                if is_connected and self.rx_char:
+                    try:
+                        await self.client.stop_notify(self.rx_char)
+                        if not self._shutdown:
+                            self.logMessage.emit("已停止通知", "info")
+                    except Exception as e:
+                        if not self._shutdown:
+                            self.logMessage.emit(f"停止通知失败: {e}", "warning")
+
+                # 断开连接
+                if is_connected:
+                    try:
+                        await self.client.disconnect()
+                        if not self._shutdown:
+                            self.logMessage.emit("BLE连接已断开", "info")
+                    except Exception as e:
+                        if not self._shutdown:
+                            self.logMessage.emit(f"断开连接失败: {e}", "warning")
+
+                # 更新状态
+                if not self._shutdown:
+                    self._status = "已断开连接"
+                    self.statusChanged.emit(self._status)
+                    self.logMessage.emit("设备已断开连接", "success")
+
+        except Exception as e:
+            if not self._shutdown:
+                self.logMessage.emit(f"断开连接时出现异常: {str(e)}", "error")
+        finally:
+            # 确保清理所有引用
+            self.client = None
+            self.rx_char = None
+            self.tx_char = None
+            # 确保状态正确
+            if not self._shutdown:
                 self._connected = False
                 self.connectedChanged.emit(False)
-                self._status = "已断开连接"
-                self.statusChanged.emit(self._status)
-                self.logMessage.emit("设备已断开连接", "info")
-            except Exception as e:
-                self.logMessage.emit(f"断开连接失败: {str(e)}", "error")
-            finally:
-                self.client = None
 
     async def _send_command(self, command):
         """异步发送命令"""
@@ -230,39 +327,94 @@ class BLEController(QObject):
             self.logMessage.emit("设备未连接", "error")
             return
 
+        if not self.tx_char:
+            self.logMessage.emit("TX特征不可用", "error")
+            return
+
         try:
-            # 确保命令以\r\n结尾
+            # 先记录发送的命令
+            display_cmd = command.strip()
+            self.logMessage.emit(f"→ {display_cmd}", "sent")
+
+            # 准备发送的数据
             if not command.endswith('\r\n'):
                 if not command.endswith('\r') and not command.endswith('\n'):
                     command += '\r\n'
 
             data = command.encode('utf-8')
-            await self.client.write_gatt_char(AT_TX_CHAR_UUID, data)
-            self.logMessage.emit(f"→ {command.strip()}", "sent")
+            print(f"发送数据: {data} (长度: {len(data)})")
+
+            # 发送数据
+            await self.client.write_gatt_char(self.tx_char, data)
+            print(f"数据发送成功")
+
+            # 稍微延迟，给设备响应时间
+            await asyncio.sleep(0.1)
 
         except Exception as e:
+            print(f"发送失败: {e}")
             self.logMessage.emit(f"发送失败: {str(e)}", "error")
 
     def _notification_handler(self, sender, data):
         """通知处理函数"""
         try:
-            text = data.decode('utf-8', errors='ignore').strip()
+            if self._shutdown:
+                return
+
+            # 先打印原始数据用于调试
+            print(f"收到原始数据: {data} (长度: {len(data)})")
+
+            # 尝试多种解码方式
+            text = ""
+            try:
+                text = data.decode('utf-8', errors='ignore')
+            except:
+                try:
+                    text = data.decode('ascii', errors='ignore')
+                except:
+                    # 如果解码失败，显示十六进制
+                    text = data.hex()
+
+            print(f"解码后文本: '{text}'")
+
             if text:
-                self.logMessage.emit(f"← {text}", "received")
+                # 处理多行数据 - 按行分割并逐行显示
+                lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+
+                for line in lines:
+                    line = line.strip()
+                    if line:  # 只显示非空行
+                        self.logMessage.emit(f"← {line}", "received")
+
+            elif len(data) > 0:
+                # 如果有数据但解码为空，显示十六进制
+                hex_str = ' '.join([f'{b:02X}' for b in data])
+                self.logMessage.emit(f"← [HEX: {hex_str}]", "received")
+
         except Exception as e:
-            self.logMessage.emit(f"数据解码错误: {str(e)}", "error")
+            if not self._shutdown:
+                print(f"通知处理异常: {e}")
+                self.logMessage.emit(f"数据处理错误: {str(e)}", "error")
 
     def _log_device_info(self, services):
         """记录设备信息"""
 
         def log_info():
+            if self._shutdown:
+                return
+
             time.sleep(0.5)
-            self.logMessage.emit("=== 设备信息 ===", "info")
-            for service in services:
-                self.logMessage.emit(f"服务: {service.uuid}", "info")
-                for char in service.characteristics:
-                    props = ', '.join(char.properties)
-                    self.logMessage.emit(f"  特征: {char.uuid} ({props})", "info")
+            if not self._shutdown:
+                self.logMessage.emit("=== 设备信息 ===", "info")
+                for service in services:
+                    if self._shutdown:
+                        break
+                    self.logMessage.emit(f"服务: {service.uuid}", "info")
+                    for char in service.characteristics:
+                        if self._shutdown:
+                            break
+                        props = ', '.join(char.properties)
+                        self.logMessage.emit(f"  特征: {char.uuid} ({props})", "info")
 
         threading.Thread(target=log_info, daemon=True).start()
 
@@ -275,6 +427,42 @@ class MainWindow(QMainWindow):
         self.log_content = []  # 存储日志内容
         self.setupUI()
         self.connectSignals()
+
+    def closeEvent(self, event):
+        """窗口关闭事件"""
+        try:
+            print("开始关闭应用...")
+            # 设置关闭标志
+            self.controller._shutdown = True
+
+            # 如果有连接，先断开
+            if self.controller._connected:
+                # 使用同步方式强制断开
+                try:
+                    if self.controller.client:
+                        import asyncio
+                        if self.controller.loop and not self.controller.loop.is_closed():
+                            future = asyncio.run_coroutine_threadsafe(
+                                self.controller._disconnect_device(),
+                                self.controller.loop
+                            )
+                            # 等待最多2秒
+                            try:
+                                future.result(timeout=2.0)
+                            except:
+                                pass
+                except Exception as e:
+                    print(f"强制断开连接失败: {e}")
+
+            # 停止事件循环
+            if self.controller.loop and not self.controller.loop.is_closed():
+                self.controller.loop.call_soon_threadsafe(self.controller.loop.stop)
+
+            print("应用关闭完成")
+        except Exception as e:
+            print(f"关闭时出错: {e}")
+        finally:
+            event.accept()
 
     def setupUI(self):
         """设置用户界面"""
@@ -504,7 +692,7 @@ class MainWindow(QMainWindow):
 
         preset_layout = QHBoxLayout()
         preset_commands = [
-            ("AT", "AT"),
+            ("读取5条", "AT+LOGLATEST=5"),
             ("获取状态", "AT+LOGSTATUS"),
             ("系统信息", "AT+LOGSTATS"),
             ("日志统计", "AT+LOGCOUNT"),
