@@ -116,6 +116,7 @@ def get_app_stylesheet():
             border-radius: 8px;
             padding: 8px;
             font-size: 14px;
+                 color: #2d3748;
         }
         QLineEdit:focus {
             border-color: #667eea;
