@@ -22,6 +22,7 @@ class BLEController(QObject):
 
     # 信号定义
     deviceFound = pyqtSignal(str, str, int)  # name, address, rssi
+    deviceLost = pyqtSignal(str)  # address - 设备离线信号
     scanningChanged = pyqtSignal(bool)
     connectedChanged = pyqtSignal(bool)
     statusChanged = pyqtSignal(str)
@@ -30,16 +31,20 @@ class BLEController(QObject):
     def __init__(self):
         super().__init__()
         self._scanning = False
+        self._continuous_scanning = False
         self._connected = False
         self._status = "就绪"
         self.client = None
         self.loop = None
         self.devices = {}
+        self.device_last_seen = {}  # 记录设备最后被发现的时间
         self._shutdown = False
         self.rx_char = None
         self.tx_char = None
         self._scanner = None
-        self._disconnect_lock = threading.Lock()  # 添加断开连接锁
+        self._disconnect_lock = threading.Lock()
+        self._scan_task = None
+        self._cleanup_task = None
 
         if BLEAK_AVAILABLE:
             self._start_event_loop()
@@ -53,6 +58,8 @@ class BLEController(QObject):
             self.loop_thread.start()
             # 等待循环启动
             time.sleep(0.1)
+            # 启动持续扫描
+            self.startContinuousScanning()
         except Exception as e:
             print(f"启动事件循环失败: {e}")
 
@@ -75,6 +82,7 @@ class BLEController(QObject):
 
         print("开始关闭BLE控制器...")
         self._shutdown = True
+        self._continuous_scanning = False
 
         # 使用锁确保断开连接的原子性
         with self._disconnect_lock:
@@ -89,10 +97,9 @@ class BLEController(QObject):
                         future = asyncio.run_coroutine_threadsafe(
                             self._cleanup_async(), self.loop
                         )
-                        future.result(timeout=5.0)  # 增加到5秒超时
+                        future.result(timeout=5.0)
                     except Exception as e:
                         print(f"异步清理失败: {e}")
-                        # 如果异步清理失败，尝试同步清理
                         self._cleanup_sync()
 
                     # 停止事件循环
@@ -105,13 +112,30 @@ class BLEController(QObject):
             except Exception as e:
                 print(f"关闭控制器时出错: {e}")
             finally:
-                # 确保所有引用都被清理
                 self._cleanup_sync()
                 print("BLE控制器关闭完成")
 
     async def _cleanup_async(self):
         """异步清理资源"""
         try:
+            # 取消持续扫描任务
+            if self._scan_task:
+                self._scan_task.cancel()
+                try:
+                    await self._scan_task
+                except asyncio.CancelledError:
+                    pass
+                self._scan_task = None
+
+            # 取消清理任务
+            if self._cleanup_task:
+                self._cleanup_task.cancel()
+                try:
+                    await self._cleanup_task
+                except asyncio.CancelledError:
+                    pass
+                self._cleanup_task = None
+
             # 停止扫描
             if self._scanner:
                 try:
@@ -158,24 +182,31 @@ class BLEController(QObject):
             self._scanner = None
             self._connected = False
             self._scanning = False
+            self._continuous_scanning = False
+            self._scan_task = None
+            self._cleanup_task = None
             print("同步清理完成")
         except Exception as e:
             print(f"同步清理失败: {e}")
 
-    def startScan(self):
-        """开始扫描设备"""
-        if not BLEAK_AVAILABLE or self._shutdown:
-            self.logMessage.emit("无法扫描设备", "error")
+    def startContinuousScanning(self):
+        """开始持续扫描"""
+        if not BLEAK_AVAILABLE or self._shutdown or self._continuous_scanning:
             return
 
+        self._continuous_scanning = True
         if self.loop and not self.loop.is_closed():
-            asyncio.run_coroutine_threadsafe(self._scan_devices(), self.loop)
+            self._scan_task = asyncio.run_coroutine_threadsafe(
+                self._continuous_scan_loop(), self.loop
+            )
+            self._cleanup_task = asyncio.run_coroutine_threadsafe(
+                self._device_cleanup_loop(), self.loop
+            )
 
-    def stopScan(self):
-        """停止扫描设备"""
+    def stopContinuousScanning(self):
+        """停止持续扫描"""
+        self._continuous_scanning = False
         self._scanning = False
-        if self.loop and not self.loop.is_closed():
-            asyncio.run_coroutine_threadsafe(self._stop_scanning(), self.loop)
 
     def connectDevice(self, address):
         """连接指定地址的设备"""
@@ -196,26 +227,47 @@ class BLEController(QObject):
         if self.loop and not self.loop.is_closed():
             asyncio.run_coroutine_threadsafe(self._send_command(command), self.loop)
 
-    async def _scan_devices(self):
-        """异步扫描设备实现"""
+    async def _continuous_scan_loop(self):
+        """持续扫描循环"""
+        self.logMessage.emit("开始持续扫描设备...", "info")
+        self._status = "持续扫描中..."
+        self.statusChanged.emit(self._status)
+
+        while self._continuous_scanning and not self._shutdown:
+            try:
+                if not self._scanning:
+                    await self._start_single_scan()
+
+                # 短暂等待后继续下一轮扫描
+                await asyncio.sleep(1.0)
+
+            except Exception as e:
+                if not self._shutdown:
+                    print(f"持续扫描异常: {e}")
+                    await asyncio.sleep(5.0)  # 出错时等待更长时间
+
+        if not self._shutdown:
+            self.logMessage.emit("持续扫描已停止", "info")
+
+    async def _start_single_scan(self):
+        """执行单次扫描"""
         if self._scanning or self._shutdown:
             return
 
         try:
             self._scanning = True
             self.scanningChanged.emit(True)
-            self._status = "扫描中..."
-            self.statusChanged.emit(self._status)
-            self.logMessage.emit("开始扫描Surron设备...", "info")
-            self.devices.clear()
 
             def detection_callback(device, advertisement_data):
-                if self._scanning and not self._shutdown:
+                if not self._shutdown:
                     name = device.name if device.name else "Unknown"
                     address = device.address
                     rssi = advertisement_data.rssi
+                    current_time = time.time()
 
+                    # 更新设备信息
                     self.devices[address] = (name, rssi)
+                    self.device_last_seen[address] = current_time
 
                     # 只发送surron设备到界面
                     if name.lower().startswith('surron-'):
@@ -224,42 +276,51 @@ class BLEController(QObject):
             self._scanner = BleakScanner(detection_callback)
             await self._scanner.start()
 
-            # 扫描10秒
+            # 扫描3秒
             scan_time = 0
-            while scan_time < 10 and self._scanning and not self._shutdown:
+            while scan_time < 3.0 and self._scanning and not self._shutdown:
                 await asyncio.sleep(0.1)
                 scan_time += 0.1
 
             await self._scanner.stop()
             self._scanner = None
 
-            if not self._shutdown:
-                self._scanning = False
-                self.scanningChanged.emit(False)
-                device_count = len([d for d in self.devices.values() if d[0].lower().startswith('surron-')])
-                self._status = f"扫描完成，发现 {device_count} 个Surron设备"
-                self.statusChanged.emit(self._status)
-                self.logMessage.emit(f"扫描完成，发现 {device_count} 个Surron设备", "success")
-
         except Exception as e:
             if not self._shutdown:
-                self._scanning = False
-                self.scanningChanged.emit(False)
-                self._status = "扫描失败"
-                self.statusChanged.emit(self._status)
-                self.logMessage.emit(f"扫描失败: {str(e)}", "error")
+                print(f"单次扫描失败: {e}")
         finally:
-            self._scanner = None
-
-    async def _stop_scanning(self):
-        """停止扫描的异步实现"""
-        try:
-            if self._scanner:
-                await self._scanner.stop()
-                self._scanner = None
+            self._scanning = False
             self.scanningChanged.emit(False)
-        except Exception as e:
-            print(f"停止扫描失败: {e}")
+
+    async def _device_cleanup_loop(self):
+        """设备清理循环 - 移除长时间未见的设备"""
+        while self._continuous_scanning and not self._shutdown:
+            try:
+                current_time = time.time()
+                devices_to_remove = []
+
+                # 检查哪些设备超过30秒未见
+                for address, last_seen in self.device_last_seen.items():
+                    if current_time - last_seen > 30.0:  # 30秒超时
+                        devices_to_remove.append(address)
+
+                # 移除超时的设备
+                for address in devices_to_remove:
+                    if address in self.devices:
+                        device_name = self.devices[address][0]
+                        if device_name.lower().startswith('surron-'):
+                            self.deviceLost.emit(address)
+                        del self.devices[address]
+                    if address in self.device_last_seen:
+                        del self.device_last_seen[address]
+
+                # 每5秒检查一次
+                await asyncio.sleep(5.0)
+
+            except Exception as e:
+                if not self._shutdown:
+                    print(f"设备清理异常: {e}")
+                await asyncio.sleep(5.0)
 
     async def _connect_device(self, address):
         """异步连接设备实现"""
@@ -289,9 +350,10 @@ class BLEController(QObject):
             if not self._shutdown:
                 self._connected = True
                 self.connectedChanged.emit(True)
-                self._status = f"已连接到 {address}"
+                device_name = self.devices.get(address, ("Unknown", 0))[0]
+                self._status = f"已连接到 {device_name} ({address})"
                 self.statusChanged.emit(self._status)
-                self.logMessage.emit(f"成功连接到 {address}", "success")
+                self.logMessage.emit(f"成功连接到 {device_name}", "success")
 
                 # 记录设备信息
                 services = await self.client.get_services()
@@ -299,7 +361,7 @@ class BLEController(QObject):
 
         except Exception as e:
             if not self._shutdown:
-                self._status = "连接失败"
+                self._status = "连接失败，继续扫描中..."
                 self.statusChanged.emit(self._status)
                 self.logMessage.emit(f"连接失败: {str(e)}", "error")
             await self._cleanup_connection()
@@ -347,13 +409,10 @@ class BLEController(QObject):
                 self.logMessage.emit("通知已启用", "success")
         except Exception as e:
             self.logMessage.emit(f"启用通知失败: {e}", "warning")
-            # 某些设备可能不支持通知，继续连接
 
     async def _disconnect_device(self):
         """安全断开设备连接"""
-        # 使用锁防止重复断开，但要小心死锁
         if not self._disconnect_lock.acquire(blocking=False):
-            # 如果无法获取锁，说明正在进行断开操作
             print("断开连接操作正在进行中...")
             return
 
@@ -361,7 +420,6 @@ class BLEController(QObject):
             if not self._connected and not self.client:
                 return
 
-            # 立即更新状态
             was_connected = self._connected
             self._connected = False
 
@@ -370,7 +428,6 @@ class BLEController(QObject):
 
             if self.client:
                 try:
-                    # 检查连接状态，添加异常处理
                     is_connected = False
                     try:
                         is_connected = getattr(self.client, 'is_connected', False)
@@ -380,7 +437,6 @@ class BLEController(QObject):
                         print(f"检查连接状态失败: {e}")
                         is_connected = False
 
-                    # 停止通知
                     if is_connected and self.rx_char:
                         try:
                             await asyncio.wait_for(
@@ -393,7 +449,6 @@ class BLEController(QObject):
                             if not self._shutdown:
                                 print(f"停止通知失败: {e}")
 
-                    # 断开连接
                     if is_connected:
                         try:
                             await asyncio.wait_for(
@@ -413,7 +468,7 @@ class BLEController(QObject):
                     await self._cleanup_connection()
 
             if not self._shutdown:
-                self._status = "已断开连接"
+                self._status = "已断开连接，继续扫描中..."
                 self.statusChanged.emit(self._status)
                 self.logMessage.emit("设备已断开连接", "success")
 
@@ -422,12 +477,10 @@ class BLEController(QObject):
                 self.logMessage.emit(f"断开连接异常: {str(e)}", "error")
                 print(f"断开连接异常: {e}")
         finally:
-            # 确保清理完成
             try:
                 await self._cleanup_connection()
             except:
                 pass
-            # 释放锁
             self._disconnect_lock.release()
 
     async def _cleanup_connection(self):
@@ -451,24 +504,20 @@ class BLEController(QObject):
             return
 
         try:
-            # 记录发送的命令
             display_cmd = command.strip()
             self.logMessage.emit(f"→ {display_cmd}", "sent")
 
-            # 准备数据
             if not command.endswith('\r\n'):
                 if not command.endswith('\r') and not command.endswith('\n'):
                     command += '\r\n'
 
             data = command.encode('utf-8')
 
-            # 发送数据
             await asyncio.wait_for(
                 self.client.write_gatt_char(self.tx_char, data),
                 timeout=5.0
             )
 
-            # 给设备响应时间
             await asyncio.sleep(0.1)
 
         except Exception as e:
@@ -481,7 +530,6 @@ class BLEController(QObject):
             return
 
         try:
-            # 解码数据
             text = ""
             try:
                 text = data.decode('utf-8', errors='ignore')
@@ -492,14 +540,12 @@ class BLEController(QObject):
                     text = data.hex()
 
             if text:
-                # 处理多行数据
                 lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
                 for line in lines:
                     line = line.strip()
                     if line:
                         self.logMessage.emit(f"← {line}", "received")
             elif len(data) > 0:
-                # 显示十六进制数据
                 hex_str = ' '.join([f'{b:02X}' for b in data])
                 self.logMessage.emit(f"← [HEX: {hex_str}]", "received")
 
@@ -508,7 +554,7 @@ class BLEController(QObject):
                 print(f"通知处理异常: {e}")
 
     def _log_device_info(self, services):
-        """异步记录设备信息"""
+        """记录设备信息"""
 
         def log_info():
             if self._shutdown:

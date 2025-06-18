@@ -9,6 +9,12 @@ from ui_components import (get_app_stylesheet, create_title_label, create_footer
                            create_left_panel, create_right_panel, DeviceListWidget,
                            LogTextEdit)
 
+# 尝试导入帮助对话框
+try:
+    from help_dialog import HelpDialog
+except ImportError:
+    HelpDialog = None
+
 
 class MainWindow(QMainWindow):
     """主窗口类 - 负责UI组装和事件处理"""
@@ -59,7 +65,7 @@ class MainWindow(QMainWindow):
         content_layout = QHBoxLayout()
         content_layout.setSpacing(20)
 
-        # 创建左侧面板（设备扫描）
+        # 创建左侧面板（设备管理）
         left_panel, self.left_widgets = self._create_left_panel_custom()
 
         # 创建右侧面板（AT命令控制台）
@@ -80,24 +86,31 @@ class MainWindow(QMainWindow):
         self._init_widget_refs()
 
     def _create_left_panel_custom(self):
-        """创建自定义左侧面板"""
+        """创建自定义左侧面板 - 移除扫描按钮"""
         from PyQt6.QtWidgets import QGroupBox, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
 
-        left_panel = QGroupBox("设备扫描")
+        left_panel = QGroupBox("设备管理")
         left_panel.setMaximumWidth(350)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setSpacing(12)
         left_layout.setContentsMargins(15, 25, 15, 15)
 
-        # 扫描控制按钮
-        scan_layout = QHBoxLayout()
-        scan_btn = QPushButton("开始扫描")
-        stop_scan_btn = QPushButton("停止扫描")
-        stop_scan_btn.setObjectName("stopButton")
-        stop_scan_btn.setEnabled(False)
-        scan_layout.addWidget(scan_btn)
-        scan_layout.addWidget(stop_scan_btn)
-        left_layout.addLayout(scan_layout)
+        # 扫描状态标签
+        scan_status_label = QLabel("🔍 正在后台扫描设备...")
+        scan_status_label.setObjectName("scanStatusLabel")
+        scan_status_label.setStyleSheet("""
+            QLabel#scanStatusLabel {
+                background: #e6f3ff;
+                border: 1px solid #4a90e2;
+                border-radius: 8px;
+                padding: 8px 12px;
+                color: #2c5aa0;
+                font-weight: bold;
+                font-size: 13px;
+                margin-bottom: 5px;
+            }
+        """)
+        left_layout.addWidget(scan_status_label)
 
         # 设备列表标签
         device_label = QLabel("发现的Surron设备 (双击连接):")
@@ -110,9 +123,9 @@ class MainWindow(QMainWindow):
 
         # 连接控制按钮
         connect_layout = QHBoxLayout()
-        connect_btn = QPushButton("连接设备")
+        connect_btn = QPushButton("🔗 连接设备")
         connect_btn.setObjectName("connectButton")
-        disconnect_btn = QPushButton("断开连接")
+        disconnect_btn = QPushButton("🔌 断开连接")
         disconnect_btn.setObjectName("disconnectButton")
         connect_btn.setEnabled(False)
         disconnect_btn.setEnabled(False)
@@ -121,13 +134,12 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(connect_layout)
 
         # 状态标签
-        status_label = QLabel("状态: 就绪")
+        status_label = QLabel("状态: 系统初始化中...")
         status_label.setObjectName("statusLabel")
         left_layout.addWidget(status_label)
 
         return left_panel, {
-            'scan_btn': scan_btn,
-            'stop_scan_btn': stop_scan_btn,
+            'scan_status_label': scan_status_label,
             'device_list': self.device_list,
             'connect_btn': connect_btn,
             'disconnect_btn': disconnect_btn,
@@ -151,11 +163,11 @@ class MainWindow(QMainWindow):
         # 预设命令按钮
         preset_layout = QHBoxLayout()
         preset_commands = [
-            ("读取5条", "AT+LOGLATEST=5"),
-            ("获取状态", "AT+LOGSTATUS"),
-            ("系统信息", "AT+LOGSTATS"),
-            ("日志统计", "AT+LOGCOUNT"),
-            ("清除日志", "AT+LOGCLEAR")
+            ("📋 读取5条", "AT+LOGLATEST=5"),
+            ("📊 获取状态", "AT+LOGSTATUS"),
+            ("🔧 系统信息", "AT+LOGSTATS"),
+            ("📈 日志统计", "AT+LOGCOUNT"),
+            ("🗑️ 清除日志", "AT+LOGCLEAR")
         ]
 
         preset_buttons = []
@@ -176,7 +188,7 @@ class MainWindow(QMainWindow):
         cmd_layout = QHBoxLayout()
         cmd_input = QLineEdit()
         cmd_input.setPlaceholderText("输入AT命令...")
-        send_btn = QPushButton("发送")
+        send_btn = QPushButton("📤 发送")
         send_btn.setEnabled(False)
         cmd_layout.addWidget(cmd_input)
         cmd_layout.addWidget(send_btn)
@@ -191,14 +203,38 @@ class MainWindow(QMainWindow):
         self.log_text = LogTextEdit()
         right_layout.addWidget(self.log_text)
 
-        # 控制按钮
+        # 控制按钮 - 添加帮助按钮
         control_layout = QHBoxLayout()
-        clear_log_btn = QPushButton("清除日志")
-        save_log_btn = QPushButton("保存日志")
+        clear_log_btn = QPushButton("🧹 清除日志")
+        save_log_btn = QPushButton("💾 保存日志")
         save_log_btn.setObjectName("saveLogButton")
+        help_btn = QPushButton("❓ 帮助")
+        help_btn.setObjectName("helpButton")
+        
+        # 设置帮助按钮样式
+        help_btn.setStyleSheet("""
+            QPushButton#helpButton {
+                background: #9f7aea;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-size: 14px;
+                font-weight: bold;
+                min-height: 25px;
+            }
+            QPushButton#helpButton:hover {
+                background: #805ad5;
+            }
+            QPushButton#helpButton:pressed {
+                background: #6b46c1;
+            }
+        """)
+        
         control_layout.addWidget(clear_log_btn)
         control_layout.addWidget(save_log_btn)
-        control_layout.addStretch()
+        control_layout.addStretch()  # 在帮助按钮前添加弹性空间，使其靠右显示
+        control_layout.addWidget(help_btn)
         right_layout.addLayout(control_layout)
 
         return right_panel, {
@@ -207,14 +243,14 @@ class MainWindow(QMainWindow):
             'send_btn': send_btn,
             'log_text': self.log_text,
             'clear_log_btn': clear_log_btn,
-            'save_log_btn': save_log_btn
+            'save_log_btn': save_log_btn,
+            'help_btn': help_btn  # 添加帮助按钮到返回字典
         }
 
     def _init_widget_refs(self):
         """初始化控件引用"""
         # 左侧控件
-        self.scan_btn = self.left_widgets['scan_btn']
-        self.stop_scan_btn = self.left_widgets['stop_scan_btn']
+        self.scan_status_label = self.left_widgets['scan_status_label']
         self.connect_btn = self.left_widgets['connect_btn']
         self.disconnect_btn = self.left_widgets['disconnect_btn']
         self.status_label = self.left_widgets['status_label']
@@ -225,12 +261,11 @@ class MainWindow(QMainWindow):
         self.send_btn = self.right_widgets['send_btn']
         self.clear_log_btn = self.right_widgets['clear_log_btn']
         self.save_log_btn = self.right_widgets['save_log_btn']
+        self.help_btn = self.right_widgets['help_btn']  # 添加帮助按钮引用
 
     def connectSignals(self):
         """连接信号和槽"""
-        # 左侧面板信号
-        self.scan_btn.clicked.connect(self.controller.startScan)
-        self.stop_scan_btn.clicked.connect(self.controller.stopScan)
+        # 左侧面板信号 - 移除扫描按钮相关信号
         self.connect_btn.clicked.connect(self.connect_device)
         self.disconnect_btn.clicked.connect(self.controller.disconnectDevice)
 
@@ -246,9 +281,11 @@ class MainWindow(QMainWindow):
         self.cmd_input.returnPressed.connect(self.send_command)
         self.clear_log_btn.clicked.connect(self.clear_log)
         self.save_log_btn.clicked.connect(self.save_log)
+        self.help_btn.clicked.connect(self.show_help)  # 连接帮助按钮信号
 
         # BLE控制器信号
         self.controller.deviceFound.connect(self.on_device_found)
+        self.controller.deviceLost.connect(self.on_device_lost)  # 新增设备丢失信号
         self.controller.scanningChanged.connect(self.on_scanning_changed)
         self.controller.connectedChanged.connect(self.on_connected_changed)
         self.controller.statusChanged.connect(self.on_status_changed)
@@ -260,13 +297,42 @@ class MainWindow(QMainWindow):
         """发现设备槽函数"""
         self.device_list.add_device(name, address, rssi)
 
+    @pyqtSlot(str)
+    def on_device_lost(self, address):
+        """设备丢失槽函数"""
+        self.device_list.remove_device(address)
+
     @pyqtSlot(bool)
     def on_scanning_changed(self, scanning):
         """扫描状态变化槽函数"""
-        self.scan_btn.setEnabled(not scanning)
-        self.stop_scan_btn.setEnabled(scanning)
         if scanning:
-            self.device_list.clear()
+            self.scan_status_label.setText("🔍 正在扫描设备...")
+            self.scan_status_label.setStyleSheet("""
+                QLabel#scanStatusLabel {
+                    background: #fff3cd;
+                    border: 1px solid #ffc107;
+                    border-radius: 8px;
+                    padding: 8px 12px;
+                    color: #856404;
+                    font-weight: bold;
+                    font-size: 13px;
+                    margin-bottom: 5px;
+                }
+            """)
+        else:
+            self.scan_status_label.setText("⏸️ 扫描暂停")
+            self.scan_status_label.setStyleSheet("""
+                QLabel#scanStatusLabel {
+                    background: #e6f3ff;
+                    border: 1px solid #4a90e2;
+                    border-radius: 8px;
+                    padding: 8px 12px;
+                    color: #2c5aa0;
+                    font-weight: bold;
+                    font-size: 13px;
+                    margin-bottom: 5px;
+                }
+            """)
 
     @pyqtSlot(bool)
     def on_connected_changed(self, connected):
@@ -333,6 +399,152 @@ class MainWindow(QMainWindow):
     def clear_log(self):
         """清除日志"""
         self.log_text.clear_log()
+
+    def show_help(self):
+        """显示帮助对话框"""
+        help_text = """AT命令参考手册
+
+═══════════════════════════════════════════════════════════════
+
+📋 支持的AT命令格式：
+
+1. 帮助命令
+   AT+LOGHELP
+   返回：所有支持的命令列表
+
+2. 状态查询
+   AT+LOGSTATUS
+   返回：日志系统初始化状态
+
+3. 统计信息
+   AT+LOGSTATS
+   返回：日志条数、存储使用情况等
+
+4. 日志条数
+   AT+LOGCOUNT
+   返回：当前日志总条数
+
+5. 读取所有日志
+   AT+LOGREADALL
+   返回：所有日志条目（分批发送）
+
+6. 读取最新N条日志
+   AT+LOGLATEST=<count>
+   示例：AT+LOGLATEST=10
+   返回：最新的10条日志
+
+7. 按序列号范围读取
+   AT+LOGRANGE=<start_seq>,<end_seq>
+   示例：AT+LOGRANGE=100,200
+   返回：序列号100-200的日志
+
+8. 按时间范围读取
+   AT+LOGTIME=<start_time>,<end_time>
+   示例：AT+LOGTIME=1000,2000
+   返回：时间戳1000-2000的日志
+
+9. 按错误码读取
+   AT+LOGERROR=<error_code_hex>,<match_bytes>
+   示例：AT+LOGERROR=100200000001,2
+   返回：匹配前2字节的所有日志
+
+10. 完整性检查
+    AT+LOGCHECK
+    返回：检查结果
+
+11. 清空所有日志
+    AT+LOGCLEAR
+    返回：清空结果（危险操作）
+
+12. 插入错误日志(指定时间)
+    AT+LOGINSERT=<error_code_hex>,<year>,<month>,<day>,<hour>,<minute>,<second>
+    示例：AT+LOGINSERT=100200000001,2025,6,11,14,30,15
+    返回：插入结果
+
+13. 插入错误日志(当前时间)
+    AT+LOGINSERTNOW=<error_code_hex>
+    示例：AT+LOGINSERTNOW=100200000001
+    返回：插入结果
+
+═══════════════════════════════════════════════════════════════
+
+📤 响应格式：
+• 成功：+LOGOK: <data>
+• 错误：+LOGERROR: <error_message>
+• 数据：+LOGDATA: <log_entry>
+
+📊 日志条目格式（新格式）：
+<total_count>,<current_index>,<timestamp>,<error_code_hex>,<checksum>
+
+示例：
+5,1,1717830615,100200000001,A5B3
+5,2,1717830620,200300000002,C7D1
+5,3,1717830625,300400000003,E9F2
+5,4,1717830630,400500000004,1A2B
+5,5,1717830635,500600000005,3C4D
+
+📝 格式说明：
+• 错误码格式：12字符十六进制字符串（6字节）
+• 时间戳：Unix时间戳（秒）
+
+═══════════════════════════════════════════════════════════════"""
+
+        # 创建消息框并设置详细内容
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("AT命令参考手册")
+        msg_box.setText("📋 Surron设备AT命令完整列表")
+        msg_box.setDetailedText(help_text)
+        msg_box.setIcon(QMessageBox.Icon.Information)
+        
+        # 设置按钮文本
+        msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg_box.button(QMessageBox.StandardButton.Ok).setText("关闭")
+        
+        # 设置消息框样式 - 改善文本颜色清晰度
+        msg_box.setStyleSheet("""
+            QMessageBox {
+                background: white;
+                font-size: 14px;
+                min-width: 600px;
+            }
+            QMessageBox QLabel {
+                color: #1a202c;
+                font-size: 16px;
+                font-weight: bold;
+                padding: 10px;
+            }
+            QMessageBox QPushButton {
+                background: #667eea;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 25px;
+                font-size: 14px;
+                font-weight: bold;
+                min-width: 100px;
+            }
+            QMessageBox QPushButton:hover {
+                background: #5a67d8;
+            }
+            QTextEdit {
+                font-family: 'Consolas', 'Monaco', 'Courier New', monospace;
+                font-size: 13px;
+                line-height: 1.6;
+                background: #f8f9fa;
+                color: #2d3748;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 15px;
+                selection-background-color: #667eea;
+                selection-color: white;
+            }
+        """)
+        
+        # 设置对话框大小
+        msg_box.resize(700, 500)
+        
+        # 显示对话框
+        msg_box.exec()
 
     def save_log(self):
         """保存日志到文件"""
