@@ -90,6 +90,7 @@ def get_app_stylesheet():
             padding: 6px;
             margin: 1px;
             border: 1px solid transparent;
+            color: #2d3748;
         }
         QListWidget::item:hover {
             background: #e9ecef;
